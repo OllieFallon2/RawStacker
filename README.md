@@ -30,4 +30,6 @@ Things to Work On:
 
 - iPhone 16/16e/16 Plus/16 Pro/16 Pro Max
 
-- iPhone 17/17 Pro/17 Pro Max/Air
+- iPhone 17/17e/17 Pro/17 Pro Max
+
+- iPhone Air
