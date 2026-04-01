@@ -26,10 +26,8 @@ class ImageStacker {
                 // Image 4 needs 1/4 opacity (0.25)
                 let alpha = 1.0 / Double(i + 1)
                 
-                // Blend 'aligned' over 'currentBase' using the alpha weight
                 let filter = CIFilter(name: "CISourceOverCompositing")!
                 
-                // Apply the alpha to the NEW image before placing it on top
                 let weightedImage = aligned.applyingFilter("CIColorMatrix", parameters: [
                     "inputRVector": CIVector(x: 1, y: 0, z: 0, w: 0),
                     "inputGVector": CIVector(x: 0, y: 1, z: 0, w: 0),
@@ -54,7 +52,6 @@ class ImageStacker {
         do {
             try handler.perform([request])
             if let observation = request.results?.first as? VNImageTranslationAlignmentObservation {
-                // Shift the target image to perfectly overlap the reference
                 return target.transformed(by: observation.alignmentTransform)
             }
         } catch {

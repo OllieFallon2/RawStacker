@@ -29,6 +29,8 @@ class CameraManager: NSObject, ObservableObject {
     @Published var maxDuration: Double = 1.0
     
     private var burstCount = 0
+    private var lockedCaptureOrientation: CGImagePropertyOrientation = .right
+    
     private var tempFolderURL: URL {
         return FileManager.default.temporaryDirectory.appendingPathComponent("RawBurst")
     }
@@ -44,9 +46,12 @@ class CameraManager: NSObject, ObservableObject {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
     }
     
-    // MARK: - Hardware Setup
     private func setupSession() {
-        sessionQueue.async { self.configureCameraHardware() }
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.configureCameraHardware()
+            self.startSession()
+        }
     }
 
     private func configureCameraHardware() {
@@ -80,25 +85,52 @@ class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    func startSession() {
+        sessionQueue.async {
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+        }
+    }
+
     func applyManualSettings() {
         guard let device = (session.inputs.first as? AVCaptureDeviceInput)?.device else { return }
+        let isManual = self.isManualMode
+        let iso = self.currentISO
+        let shutter = self.currentShutterSpeed
+        
         sessionQueue.async {
             do {
                 try device.lockForConfiguration()
-                if self.isManualMode {
-                    let safeISO = max(self.minISO, min(self.currentISO, self.maxISO))
-                    let safeDur = max(self.minDuration, min(self.currentShutterSpeed, self.maxDuration))
-                    let duration = CMTime(seconds: safeDur, preferredTimescale: 1000000)
+                
+                if isManual {
+                    if device.isExposureModeSupported(.custom) {
+                        device.exposureMode = .custom
+                    }
+                    
+                    let safeISO = max(device.activeFormat.minISO, min(iso, device.activeFormat.maxISO))
+                    let duration = CMTime(seconds: shutter, preferredTimescale: 1000000)
+                    
                     device.setExposureModeCustom(duration: duration, iso: safeISO, completionHandler: nil)
                 } else {
-                    device.exposureMode = .continuousAutoExposure
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
                 }
+                
                 device.unlockForConfiguration()
-            } catch { print("Exposure Error: \(error)") }
+            } catch {
+                print("Hardware Lock Error: \(error)")
+            }
         }
     }
 
     func handleCapture() {
+        let scenes = UIApplication.shared.connectedScenes
+        let windowScene = scenes.first as? UIWindowScene
+        let uiOrient = windowScene?.interfaceOrientation ?? .portrait
+        self.lockedCaptureOrientation = CGImagePropertyOrientation(uiOrient)
+
         if isStackingEnabled {
             prepareTempFolder()
             burstCount = 0
@@ -113,17 +145,34 @@ class CameraManager: NSObject, ObservableObject {
     }
 
     private func executeHardwareCapture() {
-        guard let rawFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first else {
-            print("Hardware reports RAW not supported")
-            return
-        }
+        guard let rawFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first else { return }
         
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         if #available(iOS 16.0, *) {
             settings.maxPhotoDimensions = self.photoOutput.maxPhotoDimensions
         }
+
+        if let connection = self.photoOutput.connection(with: .video) {
+            let scenes = UIApplication.shared.connectedScenes
+            let windowScene = scenes.first as? UIWindowScene
+            let uiOrient = windowScene?.interfaceOrientation ?? .portrait
+            
+            let angle = rotationAngle(for: uiOrient)
+            if connection.isVideoRotationAngleSupported(angle) {
+                connection.videoRotationAngle = angle
+            }
+        }
+
         self.photoOutput.capturePhoto(with: settings, delegate: self)
-        print("Shutter Signal Sent!")
+    }
+
+    private func rotationAngle(for orientation: UIInterfaceOrientation) -> CGFloat {
+        switch orientation {
+        case .landscapeLeft: return 180
+        case .landscapeRight: return 0
+        case .portraitUpsideDown: return 270
+        default: return 90
+        }
     }
 
     private func captureBurst(count: Int) {
@@ -141,12 +190,15 @@ class CameraManager: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             let urls = (try? FileManager.default.contentsOfDirectory(at: self.tempFolderURL, includingPropertiesForKeys: nil)) ?? []
+            
             self.stacker.stackImages(urls: urls) { [weak self] finalImage in
                 guard let self = self, let final = finalImage else {
                     DispatchQueue.main.async { self?.isProcessing = false }; return
                 }
+                
                 let context = CIContext(options: [.workingColorSpace: NSNull()])
-                let orientation = CGImagePropertyOrientation(UIDevice.current.orientation)
+                let orientation = self.lockedCaptureOrientation
+                
                 if let cgImage = context.createCGImage(final, from: final.extent) {
                     let data: Data?
                     if self.saveAsJPEG {
@@ -155,10 +207,11 @@ class CameraManager: NSObject, ObservableObject {
                     } else {
                         data = self.convertBufferToTIFF(cgImage, orientation: orientation)
                     }
+                    
                     if let finalData = data {
                         PHPhotoLibrary.shared().performChanges({
                             PHAssetCreationRequest.forAsset().addResource(with: .photo, data: finalData, options: nil)
-                        }) { success, _ in
+                        }) { _, _ in
                             DispatchQueue.main.async {
                                 self.isProcessing = false
                                 self.prepareTempFolder()
@@ -181,11 +234,9 @@ class CameraManager: NSObject, ObservableObject {
     }
 
     private func uiOrientationFrom(_ orientation: CGImagePropertyOrientation) -> UIImage.Orientation {
-        switch orientation { case .up: return .up; case .down: return .down; case .left: return .left; case .right: return .right; default: return .up }
-    }
-
-    func startSession() {
-        sessionQueue.async { if !self.session.isRunning { self.session.startRunning() } }
+        switch orientation {
+        case .up: return .up; case .down: return .down; case .left: return .left; case .right: return .right; default: return .up
+        }
     }
     
     private func prepareTempFolder() {
@@ -215,15 +266,22 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.processStack() }
                 }
             } else {
-                PHPhotoLibrary.shared().performChanges { PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil) }
+                PHPhotoLibrary.shared().performChanges {
+                    PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
+                }
             }
         }
     }
 }
 
 extension CGImagePropertyOrientation {
-    init(_ uiOrientation: UIDeviceOrientation) {
-        switch uiOrientation { case .portrait: self = .right; case .portraitUpsideDown: self = .left; case .landscapeLeft: self = .up; case .landscapeRight: self = .down; default: self = .right }
+    init(_ uiOrientation: UIInterfaceOrientation) {
+        switch uiOrientation {
+        case .portrait: self = .right
+        case .portraitUpsideDown: self = .left
+        case .landscapeLeft: self = .up
+        case .landscapeRight: self = .down
+        default: self = .right
+        }
     }
 }
-
